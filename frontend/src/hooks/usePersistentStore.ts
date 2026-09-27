@@ -5,7 +5,7 @@ import type { Cave, Segment, Sketch, Station } from '@/types'
 import { computeHorizontal, computeVertical } from '@/utils/survey'
 
 /** IndexedDB 数据结构版本号（升级迁移时使用） */
-export const SCHEMA_VERSION = 2
+export const SCHEMA_VERSION = 3
 
 export interface MetaRow {
   key: string
@@ -50,6 +50,39 @@ class CaveSurveyDb extends Dexie {
               station.verticalDistance = computeVertical(station.dip, station.slopeDistance)
             }
           })
+      })
+    // v3：拼合编排改为「按洞穴独立」保存——每个洞内顺序号从 1 连续编号，
+    // 偏移与吸附状态下沉到草图记录持久化，切换洞穴/重开后仍按原编排显示
+    this.version(SCHEMA_VERSION)
+      .stores({
+        caves: 'id, name, region, archived',
+        segments: 'id, caveId, code, type',
+        stations: 'id, segmentId, code, date',
+        sketches: 'id, segmentId, code, mergeOrder',
+        meta: 'key'
+      })
+      .upgrade(async (tx) => {
+        const [segments, sketches] = await Promise.all([
+          tx.table<Segment, string>('segments').toArray(),
+          tx.table<Sketch, string>('sketches').toArray()
+        ])
+        const caveOf = new Map(segments.map((segment) => [segment.id, segment.caveId]))
+        const groups = new Map<string, Sketch[]>()
+        for (const sketch of sketches) {
+          const caveId = caveOf.get(sketch.segmentId) ?? '__unassigned__'
+          const list = groups.get(caveId) ?? []
+          list.push(sketch)
+          groups.set(caveId, list)
+        }
+        for (const list of groups.values()) {
+          list.sort((a, b) => a.mergeOrder - b.mergeOrder)
+          list.forEach((sketch, index) => {
+            sketch.mergeOrder = index + 1
+            if (typeof (sketch as Partial<Sketch>).offset !== 'number') sketch.offset = 0
+            if (typeof (sketch as Partial<Sketch>).snapped !== 'boolean') sketch.snapped = false
+          })
+        }
+        await tx.table<Sketch, string>('sketches').bulkPut(sketches)
       })
   }
 }
@@ -197,7 +230,9 @@ export async function seedDemoData(): Promise<void> {
       author: '陆昀',
       mergeOrder: 1,
       anchorStake: 'K0+000',
-      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注'
+      imageNote: '平面展开草图，坐标纸 48 格，含左壁支护标注',
+      offset: 0,
+      snapped: false
     },
     {
       id: 'sk_demo_002',
@@ -208,7 +243,9 @@ export async function seedDemoData(): Promise<void> {
       author: '覃羽',
       mergeOrder: 2,
       anchorStake: 'K0+120',
-      imageNote: '竖井剖面草图，标注三处锚点'
+      imageNote: '竖井剖面草图，标注三处锚点',
+      offset: 0,
+      snapped: false
     }
   ])
 }

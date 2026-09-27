@@ -1,4 +1,4 @@
-/** Sketch 草图 */
+/** Sketch 草图（拼合编排按所属洞穴独立保存） */
 export interface Sketch {
   id: string
   segmentId: string
@@ -10,19 +10,14 @@ export interface Sketch {
   scale: number
   /** 绘制人 */
   author: string
-  /** 图幅拼合顺序号 */
+  /** 图幅拼合顺序号（在本洞内从 1 起连续编号） */
   mergeOrder: number
   /** 桩号对齐锚点 */
   anchorStake: string
   /** 图片数据说明 */
   imageNote: string
-}
-
-/** 图幅拼合对齐结果 */
-export interface MergeItem {
-  sketchId: string
-  /** 对齐后的横向偏移（单位：格） */
+  /** 拼合台横向偏移（px，随编排一起持久化） */
   offset: number
-  /** 是否已吸附到锚点 */
+  /** 是否已吸附（随编排一起持久化） */
   snapped: boolean
 }

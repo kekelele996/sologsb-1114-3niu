@@ -70,9 +70,10 @@ watch(
 watch(
   mergeSketches,
   (list) => {
+    // 重开或切换洞穴后，从持久化的草图记录恢复偏移与吸附状态；已存在的本地值不覆盖
     list.forEach((sketch) => {
-      if (offsets[sketch.id] === undefined) offsets[sketch.id] = 0
-      if (snapped[sketch.id] === undefined) snapped[sketch.id] = false
+      if (offsets[sketch.id] === undefined) offsets[sketch.id] = sketch.offset ?? 0
+      if (snapped[sketch.id] === undefined) snapped[sketch.id] = sketch.snapped ?? false
     })
   },
   { immediate: true }
@@ -87,7 +88,7 @@ const caveStations = computed(() =>
 const { result: closureResult } = useClosureCheck(caveStations)
 
 /** 按桩号锚点自动吸附：以最小锚点桩号为原点，按桩号差换算横向偏移 */
-function autoAlign(): void {
+async function autoAlign(): Promise<void> {
   const list = mergeSketches.value
   if (list.length === 0) {
     ElMessage.warning('当前洞穴暂无可拼合草图')
@@ -95,14 +96,18 @@ function autoAlign(): void {
   }
   const base = Math.min(...list.map((sketch) => stakeToNumber(sketch.anchorStake)))
   const logs: string[] = []
+  const updates: { id: string; offset: number; snapped: boolean }[] = []
   list.forEach((sketch) => {
     const stake = stakeToNumber(sketch.anchorStake)
     const target = Math.round((stake - base) * PX_PER_METER)
     offsets[sketch.id] = target
     snapped[sketch.id] = true
+    updates.push({ id: sketch.id, offset: target, snapped: true })
     logs.push(`${sketch.code} 锚点 ${sketch.anchorStake} → 偏移 ${target}px`)
   })
   snapLog.value = logs
+  // 吸附结果随本洞编排一起持久化，切换洞穴/重开仍保留
+  await sketchStore.getState().setLayouts(updates)
   ElMessage.success(`已按桩号锚点吸附 ${list.length} 张图幅`)
 }
 
@@ -137,8 +142,12 @@ function onMouseMove(event: MouseEvent): void {
   }
 }
 
-function onMouseUp(): void {
+async function onMouseUp(): Promise<void> {
+  const id = draggingId.value
   draggingId.value = null
+  if (!id) return
+  // 松手即把该图幅的偏移与吸附状态保存到本洞编排
+  await sketchStore.getState().setLayout(id, offsets[id] ?? 0, snapped[id] ?? false)
 }
 
 /** 拼合顺序表（输出结果） */
@@ -172,20 +181,103 @@ async function move(index: number, direction: -1 | 1): Promise<void> {
   await sketchStore.getState().reorder(list.map((sketch) => sketch.id))
 }
 
+const exportTime = ref('')
+const exportErrors = ref<string[]>([])
+
+function nowText(): string {
+  const d = new Date()
+  const p = (n: number): string => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
+/**
+ * 导出前检查：拼合顺序连续、草图编号无缺失/重复、锚点无缺失/重复。
+ * 返回问题清单（逐条点到具体图幅），非空即拒绝导出。
+ */
+function validateBeforeExport(rows: MergeRow[]): string[] {
+  const errors: string[] = []
+  if (rows.length === 0) {
+    errors.push('当前洞穴没有可导出的图幅，请先到「草图工作台」建立草图。')
+    return errors
+  }
+
+  // 拼合顺序：必须从 1 起连续
+  rows.forEach((row, index) => {
+    if (row.order !== index + 1) {
+      errors.push(`拼合顺序不连续：第 ${index + 1} 位实际编号为 ${row.order}（图幅 ${row.code}）。`)
+    }
+  })
+
+  // 草图编号：缺失
+  rows.forEach((row) => {
+    if (!row.code.trim()) errors.push(`第 ${row.order} 张图幅（洞段 ${row.segment}）缺少草图编号。`)
+  })
+  // 草图编号：重复
+  const codePositions = new Map<string, string[]>()
+  rows.forEach((row) => {
+    const code = row.code.trim()
+    if (!code) return
+    const positions = codePositions.get(code) ?? []
+    positions.push(`顺序${row.order}`)
+    codePositions.set(code, positions)
+  })
+  codePositions.forEach((positions, code) => {
+    if (positions.length > 1) errors.push(`草图编号重复：${code} 同时出现于 ${positions.join('、')}。`)
+  })
+
+  // 锚点：缺失
+  rows.forEach((row) => {
+    if (!row.anchorStake.trim()) errors.push(`图幅 ${row.code}（顺序${row.order}）缺少桩号对齐锚点。`)
+  })
+  // 锚点：重复
+  const anchorCodes = new Map<string, string[]>()
+  rows.forEach((row) => {
+    const anchor = row.anchorStake.trim()
+    if (!anchor) return
+    const codes = anchorCodes.get(anchor) ?? []
+    codes.push(row.code)
+    anchorCodes.set(anchor, codes)
+  })
+  anchorCodes.forEach((codes, anchor) => {
+    if (codes.length > 1) errors.push(`锚点桩号重复：${anchor} 被 ${codes.join('、')} 同时占用。`)
+  })
+
+  return errors
+}
+
 function exportMergeTable(): void {
+  const rows = mergeRows.value
+  const errors = validateBeforeExport(rows)
+  exportErrors.value = errors
+  if (errors.length > 0) {
+    ElMessage.error('导出前检查未通过，已拒绝导出，请按提示修正')
+    return
+  }
+
+  exportTime.value = nowText()
+  const data = rows.map((row) => ({
+    order: row.order,
+    segment: row.segment,
+    code: row.code,
+    anchorStake: row.anchorStake,
+    offset: row.offset,
+    snapped: row.snapped ? '已吸附' : '未吸附',
+    exportedAt: exportTime.value
+  }))
   downloadCsv(
-    '图幅拼合顺序表.csv',
-    mergeRows.value as unknown as Record<string, unknown>[],
+    `图幅拼合顺序表_${exportTime.value.replace(/[:\s]/g, '-')}.csv`,
+    data as unknown as Record<string, unknown>[],
     [
       { key: 'order', label: '拼合顺序' },
-      { key: 'code', label: '草图编号' },
       { key: 'segment', label: '洞段' },
-      { key: 'anchorStake', label: '锚点桩号' },
+      { key: 'code', label: '草图编号' },
+      { key: 'anchorStake', label: '桩号对齐锚点' },
       { key: 'offset', label: '对齐偏移(px)' },
-      { key: 'snapped', label: '是否吸附' }
+      { key: 'snapped', label: '吸附状态' },
+      { key: 'exportedAt', label: '导出时间' }
     ]
   )
-  ElMessage.success('拼合顺序表已导出')
+  ElMessage.success(`拼合顺序表已导出（${exportTime.value}）`)
 }
 </script>
 
@@ -195,7 +287,7 @@ function exportMergeTable(): void {
       <div>
         <h2 class="page-title">图幅拼合视图</h2>
         <p class="page-sub">
-          拖动图幅可按相邻边缘吸附对齐，也可按桩号锚点一键对齐；下方输出拼合顺序表，顺序可直接调整。
+          每个洞穴的图幅顺序、偏移与吸附状态独立保存：新图自动接在本洞末尾，上移下移只重排本洞并连续编号，删除后自动补位；切换洞穴或重开仍按原编排显示。
         </p>
       </div>
       <div class="head-actions">
@@ -302,6 +394,22 @@ function exportMergeTable(): void {
     </div>
 
     <h3 class="section-title">图幅拼合顺序表</h3>
+    <el-alert
+      v-if="exportErrors.length > 0"
+      class="export-alert"
+      type="error"
+      :closable="true"
+      show-icon
+      title="导出前检查未通过，已拒绝导出"
+      @close="exportErrors = []"
+    >
+      <ul class="export-errors">
+        <li v-for="(line, index) in exportErrors" :key="index">{{ line }}</li>
+      </ul>
+    </el-alert>
+    <el-tag v-if="exportTime" type="success" effect="plain" class="export-time">
+      最近导出时间：{{ exportTime }}
+    </el-tag>
     <el-table :data="mergeRows" border stripe>
       <el-table-column prop="order" label="拼合顺序" width="100" />
       <el-table-column prop="code" label="草图编号" width="120" />
@@ -339,6 +447,16 @@ function exportMergeTable(): void {
 .head-actions {
   display: flex;
   gap: 8px;
+}
+.export-alert {
+  margin-bottom: 12px;
+}
+.export-errors {
+  margin: 0;
+  padding-left: 18px;
+}
+.export-time {
+  margin-bottom: 12px;
 }
 .seg-tags {
   display: flex;
