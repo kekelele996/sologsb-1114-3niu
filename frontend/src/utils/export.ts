@@ -11,6 +11,12 @@ export function downloadText(filename: string, content: string, mime = 'text/pla
   URL.revokeObjectURL(url)
 }
 
+/** 格式化为本地时间字符串，如 2026-09-26 15:30:08 */
+export function formatTimestamp(date: Date): string {
+  const pad = (value: number): string => String(value).padStart(2, '0')
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`
+}
+
 /** 导出 JSON */
 export function downloadJson(filename: string, data: unknown): void {
   downloadText(filename, JSON.stringify(data, null, 2), 'application/json;charset=utf-8')

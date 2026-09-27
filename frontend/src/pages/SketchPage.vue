@@ -32,7 +32,6 @@ const form = reactive({
   gridCount: 40,
   scale: 200,
   author: '',
-  mergeOrder: 1,
   anchorStake: 'K0+000',
   imageNote: ''
 })
@@ -41,6 +40,12 @@ const segmentOptions = computed(() =>
   segmentState.segments.filter((segment) => !selectedCaveId.value || segment.caveId === selectedCaveId.value)
 )
 const currentSegment = computed(() => segmentState.segments.find((segment) => segment.id === selectedSegmentId.value))
+
+/** 当前洞穴已建档草图数（用于建议下一张草图编号） */
+const caveSketchCount = computed(() => {
+  const segmentIds = new Set(segmentOptions.value.map((segment) => segment.id))
+  return sketchState.sketches.filter((sketch) => segmentIds.has(sketch.segmentId)).length
+})
 
 // IndexedDB 异步水合完成后自动选中第一条洞穴 / 洞段
 watch(
@@ -119,11 +124,10 @@ function dipArrow(point: PlotPoint, index: number): { x2: number; y2: number } {
 
 function resetForm(): void {
   editingId.value = null
-  form.code = `S-${String(sketchState.sketches.length + 1).padStart(2, '0')}`
+  form.code = `S-${String(caveSketchCount.value + 1).padStart(2, '0')}`
   form.gridCount = 40
   form.scale = 200
   form.author = caveState.caves.find((cave) => cave.id === selectedCaveId.value)?.surveyor ?? ''
-  form.mergeOrder = sketchState.sketches.length + 1
   form.anchorStake = currentSegment.value?.startStake ?? 'K0+000'
   form.imageNote = ''
 }
@@ -153,7 +157,8 @@ async function submit(): Promise<void> {
     gridCount: Number(form.gridCount) || 0,
     scale: Number(form.scale) || 100,
     author: form.author.trim(),
-    mergeOrder: Number(form.mergeOrder) || 1,
+    // 拼合顺序由拼合目录维护：新图自动接在本洞末尾，编辑本洞图幅时保持原序号
+    mergeOrder: existing?.mergeOrder ?? 0,
     anchorStake: form.anchorStake.trim(),
     imageNote: form.imageNote.trim()
   }
@@ -168,7 +173,6 @@ function editSketch(sketch: Sketch): void {
   form.gridCount = sketch.gridCount
   form.scale = sketch.scale
   form.author = sketch.author
-  form.mergeOrder = sketch.mergeOrder
   form.anchorStake = sketch.anchorStake
   form.imageNote = sketch.imageNote
 }
@@ -267,7 +271,7 @@ async function removeSketch(sketch: Sketch): Promise<void> {
             <el-input v-model="form.author" />
           </el-form-item>
           <el-form-item label="拼合顺序">
-            <el-input-number v-model="form.mergeOrder" :min="1" :controls="false" style="width: 100%" />
+            <span class="order-hint">按洞穴自动连续编号：新图接在本洞末尾，可在「图幅拼合」中上移/下移调整</span>
           </el-form-item>
           <el-form-item label="锚点桩号">
             <el-input v-model="form.anchorStake" placeholder="如 K0+120" />
@@ -322,5 +326,10 @@ async function removeSketch(sketch: Sketch): Promise<void> {
   display: flex;
   gap: 8px;
   padding-left: 90px;
+}
+.order-hint {
+  font-size: 12px;
+  color: #8a97a3;
+  line-height: 1.6;
 }
 </style>

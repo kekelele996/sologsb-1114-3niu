@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue'
-import { ElMessage } from 'element-plus'
-import type { Sketch } from '@/types'
+import { computed, h, reactive, ref, watch } from 'vue'
+import { ElMessage, ElMessageBox } from 'element-plus'
+import type { MergeItem, Sketch } from '@/types'
 import ClosureBadge from '@/components/common/ClosureBadge.vue'
 import GridCanvas from '@/components/common/GridCanvas.vue'
 import SegmentTag from '@/components/common/SegmentTag.vue'
@@ -11,7 +11,7 @@ import { caveStore } from '@/stores/caveStore'
 import { segmentStore } from '@/stores/segmentStore'
 import { stationStore } from '@/stores/stationStore'
 import { sketchStore } from '@/stores/sketchStore'
-import { downloadCsv } from '@/utils/export'
+import { downloadCsv, formatTimestamp } from '@/utils/export'
 import { stakeToNumber } from '@/utils/survey'
 
 const CANVAS_W = 780
@@ -67,12 +67,15 @@ watch(
   { immediate: true }
 )
 
+// 拼合布局随图幅持久化：切换洞穴或重开页面后按原编排恢复；
+// 拖拽进行中以本地值为准，避免被水合结果覆盖
 watch(
   mergeSketches,
   (list) => {
     list.forEach((sketch) => {
-      if (offsets[sketch.id] === undefined) offsets[sketch.id] = 0
-      if (snapped[sketch.id] === undefined) snapped[sketch.id] = false
+      if (draggingId.value === sketch.id) return
+      offsets[sketch.id] = sketch.mergeOffset ?? 0
+      snapped[sketch.id] = sketch.mergeSnapped ?? false
     })
   },
   { immediate: true }
@@ -87,7 +90,7 @@ const caveStations = computed(() =>
 const { result: closureResult } = useClosureCheck(caveStations)
 
 /** 按桩号锚点自动吸附：以最小锚点桩号为原点，按桩号差换算横向偏移 */
-function autoAlign(): void {
+async function autoAlign(): Promise<void> {
   const list = mergeSketches.value
   if (list.length === 0) {
     ElMessage.warning('当前洞穴暂无可拼合草图')
@@ -95,14 +98,17 @@ function autoAlign(): void {
   }
   const base = Math.min(...list.map((sketch) => stakeToNumber(sketch.anchorStake)))
   const logs: string[] = []
+  const layout: MergeItem[] = []
   list.forEach((sketch) => {
     const stake = stakeToNumber(sketch.anchorStake)
     const target = Math.round((stake - base) * PX_PER_METER)
     offsets[sketch.id] = target
     snapped[sketch.id] = true
+    layout.push({ sketchId: sketch.id, offset: target, snapped: true })
     logs.push(`${sketch.code} 锚点 ${sketch.anchorStake} → 偏移 ${target}px`)
   })
   snapLog.value = logs
+  await sketchStore.getState().saveLayout(layout)
   ElMessage.success(`已按桩号锚点吸附 ${list.length} 张图幅`)
 }
 
@@ -137,8 +143,12 @@ function onMouseMove(event: MouseEvent): void {
   }
 }
 
-function onMouseUp(): void {
+async function onMouseUp(): Promise<void> {
+  const id = draggingId.value
   draggingId.value = null
+  if (!id) return
+  // 拖拽结束后把该图幅的偏移与吸附状态写入本洞拼合目录
+  await sketchStore.getState().saveLayout([{ sketchId: id, offset: offsets[id] ?? 0, snapped: snapped[id] ?? false }])
 }
 
 /** 拼合顺序表（输出结果） */
@@ -169,20 +179,83 @@ async function move(index: number, direction: -1 | 1): Promise<void> {
   const temp = list[index]
   list[index] = list[target]
   list[target] = temp
+  // 只重排本洞图幅，连续编号由 store 保证不波及其他洞穴
   await sketchStore.getState().reorder(list.map((sketch) => sketch.id))
 }
 
-function exportMergeTable(): void {
+/** 导出前检查：草图编号与桩号锚点重复或缺失时，逐条指出具体图幅 */
+function collectExportProblems(): string[] {
+  const problems: string[] = []
+  const list = mergeSketches.value
+  const codeGroups = new Map<string, Sketch[]>()
+  const anchorGroups = new Map<string, Sketch[]>()
+  list.forEach((sketch) => {
+    const code = sketch.code.trim()
+    const anchor = sketch.anchorStake.trim()
+    if (!code) {
+      problems.push(`图幅缺少草图编号（洞段 ${segmentOf(sketch)}，锚点 ${anchor || '未填'}）`)
+    } else {
+      codeGroups.set(code, [...(codeGroups.get(code) ?? []), sketch])
+    }
+    if (!anchor) {
+      problems.push(`图幅「${code || '未编号'}」缺少桩号锚点（洞段 ${segmentOf(sketch)}）`)
+    } else {
+      anchorGroups.set(anchor, [...(anchorGroups.get(anchor) ?? []), sketch])
+    }
+  })
+  codeGroups.forEach((group, code) => {
+    if (group.length > 1) {
+      problems.push(
+        `草图编号「${code}」重复 ${group.length} 次（洞段 ${group.map((sketch) => segmentOf(sketch)).join('、')}）`
+      )
+    }
+  })
+  anchorGroups.forEach((group, anchor) => {
+    if (group.length > 1) {
+      problems.push(
+        `桩号锚点「${anchor}」被 ${group.length} 张图幅重复使用（${group.map((sketch) => sketch.code.trim() || '未编号').join('、')}）`
+      )
+    }
+  })
+  return problems
+}
+
+async function exportMergeTable(): Promise<void> {
+  if (mergeSketches.value.length === 0) {
+    ElMessage.warning('当前洞穴暂无可拼合草图')
+    return
+  }
+  const problems = collectExportProblems()
+  if (problems.length > 0) {
+    await ElMessageBox.alert(
+      h('div', problems.map((item) => h('div', { style: 'line-height:1.9' }, `• ${item}`))),
+      '导出前检查未通过，请修正后重试',
+      { type: 'error', confirmButtonText: '知道了' }
+    )
+    return
+  }
+  const exportedAt = formatTimestamp(new Date())
+  const caveName = caveState.caves.find((cave) => cave.id === selectedCaveId.value)?.name ?? '全部洞穴'
+  const rows = mergeRows.value.map((row) => ({
+    order: row.order,
+    code: row.code,
+    segment: row.segment,
+    anchorStake: row.anchorStake,
+    offset: row.offset,
+    snapped: row.snapped ? '已吸附' : '未吸附',
+    exportedAt
+  }))
   downloadCsv(
-    '图幅拼合顺序表.csv',
-    mergeRows.value as unknown as Record<string, unknown>[],
+    `图幅拼合顺序表_${caveName}_${exportedAt.replace(/[-:]/g, '').replace(' ', '_')}.csv`,
+    rows,
     [
       { key: 'order', label: '拼合顺序' },
       { key: 'code', label: '草图编号' },
       { key: 'segment', label: '洞段' },
       { key: 'anchorStake', label: '锚点桩号' },
       { key: 'offset', label: '对齐偏移(px)' },
-      { key: 'snapped', label: '是否吸附' }
+      { key: 'snapped', label: '是否吸附' },
+      { key: 'exportedAt', label: '导出时间' }
     ]
   )
   ElMessage.success('拼合顺序表已导出')
@@ -195,7 +268,7 @@ function exportMergeTable(): void {
       <div>
         <h2 class="page-title">图幅拼合视图</h2>
         <p class="page-sub">
-          拖动图幅可按相邻边缘吸附对齐，也可按桩号锚点一键对齐；下方输出拼合顺序表，顺序可直接调整。
+          拼合目录按洞穴保存：新图接在本洞末尾，上移/下移只调整本洞编号，偏移与吸附状态随图幅持久化；导出前自动检查草图编号与锚点。
         </p>
       </div>
       <div class="head-actions">
